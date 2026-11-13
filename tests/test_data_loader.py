@@ -18,7 +18,7 @@ import weakref
 import pytest
 import torch
 from parameterized import parameterized
-from torch.utils.data import BatchSampler, DataLoader, IterableDataset
+from torch.utils.data import BatchSampler, DataLoader, IterableDataset, TensorDataset
 
 from accelerate import Accelerator, PartialState
 from accelerate.data_loader import (
@@ -175,6 +175,60 @@ class DataLoaderTester(AccelerateTestCase):
         batch_sampler = BatchSampler(range(2), batch_size=3, drop_last=True)
         expected = [[], []]
         self.check_batch_sampler_shards(batch_sampler, expected)
+
+    def test_single_full_batch_is_not_replicated_across_processes(self):
+        # Exactly one full batch cannot be given to every process without duplicating it.
+        # With split_batches=False and even_batches=True the yielded count must stay a
+        # multiple of num_processes, so every process yields nothing instead of the same batch.
+        dataset = TensorDataset(torch.arange(6).view(3, 2))
+        loader = DataLoader(dataset, batch_size=3)
+        self._assert_no_replicated_single_full_batch(loader.batch_sampler, num_processes=3)
+
+        batch_sampler = BatchSampler(range(4), batch_size=4, drop_last=False)
+        self._assert_no_replicated_single_full_batch(batch_sampler, num_processes=2)
+
+        # split_batches=True still divides that single batch across processes.
+        shards = [BatchSamplerShard(batch_sampler, 2, i, split_batches=True, even_batches=True) for i in range(2)]
+        assert [list(shard) for shard in shards] == [[[0, 1]], [[2, 3]]]
+        assert [len(shard) for shard in shards] == [1, 1]
+
+        # A partial batch is still completed from the start, and processes do not see identical batches.
+        batch_sampler = BatchSampler(range(2), batch_size=3, drop_last=False)
+        shards = [BatchSamplerShard(batch_sampler, 2, i, split_batches=False, even_batches=True) for i in range(2)]
+        assert [list(shard) for shard in shards] == [[[0, 1, 0]], [[1, 0, 1]]]
+
+        # More than one full batch keeps the usual sharding. Only the incomplete round is padded.
+        batch_sampler = BatchSampler(range(6), batch_size=3, drop_last=False)
+        shards = [BatchSamplerShard(batch_sampler, 3, i, split_batches=False, even_batches=True) for i in range(3)]
+        assert [list(shard) for shard in shards] == [[[0, 1, 2]], [[3, 4, 5]], [[0, 1, 2]]]
+        assert len({tuple(tuple(batch) for batch in list(shard)) for shard in shards}) > 1
+
+        # even_batches=False still assigns the only full batch to the process that owns it.
+        batch_sampler = BatchSampler(range(3), batch_size=3, drop_last=False)
+        shards = [BatchSamplerShard(batch_sampler, 3, i, split_batches=False, even_batches=False) for i in range(3)]
+        assert [list(shard) for shard in shards] == [[[0, 1, 2]], [], []]
+
+        # drop_last already drops an incomplete round of processes.
+        batch_sampler = BatchSampler(range(3), batch_size=3, drop_last=True)
+        shards = [BatchSamplerShard(batch_sampler, 3, i, split_batches=False, even_batches=True) for i in range(3)]
+        assert [list(shard) for shard in shards] == [[], [], []]
+        assert [len(shard) for shard in shards] == [0, 0, 0]
+
+    def _assert_no_replicated_single_full_batch(self, batch_sampler, num_processes):
+        shards = [
+            BatchSamplerShard(
+                batch_sampler,
+                num_processes,
+                process_index,
+                split_batches=False,
+                even_batches=True,
+            )
+            for process_index in range(num_processes)
+        ]
+        yielded = [list(shard) for shard in shards]
+        assert all(batches == [] for batches in yielded)
+        assert [len(shard) for shard in shards] == [0] * num_processes
+        assert sum(len(shard) for shard in shards) % num_processes == 0
 
     def test_batch_sampler_shards_with_splits(self):
         # Check the shards when the dataset is a round multiple of batch size.
