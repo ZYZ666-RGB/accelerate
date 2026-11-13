@@ -124,7 +124,9 @@ class BatchSamplerShard(BatchSampler):
               then `[6, 7]` if this argument is set to `True`.
         even_batches (`bool`, *optional*, defaults to `True`):
             Whether or not to loop back at the beginning of the sampler when the number of samples is not a round
-            multiple of (original batch size / number of processes).
+            multiple of (original batch size / number of processes). With `split_batches=False`, if the sampler yields
+            exactly one full batch and there is more than one process, that batch is not copied onto every process:
+            every process yields no batches, so the number of batches stays a multiple of `num_processes`.
 
     <Tip warning={true}>
 
@@ -170,6 +172,9 @@ class BatchSamplerShard(BatchSampler):
             # Same if we drop the remainder.
             return length
         elif self.even_batches:
+            # One full batch would otherwise be copied onto every process.
+            if self._is_single_full_batch():
+                return 0
             # When we even batches we always get +1
             return length + 1
         else:
@@ -178,6 +183,27 @@ class BatchSamplerShard(BatchSampler):
 
     def __iter__(self):
         return self._iter_with_split() if self.split_batches else self._iter_with_no_split()
+
+    def _is_single_full_batch(self) -> bool:
+        """Whether the wrapped sampler yields exactly one full batch.
+
+        With `split_batches=False` and more than one process, copying that batch onto every process duplicates the
+        whole dataset. A shorter final batch is not included: it is still completed from samples at the start.
+        """
+        if self.split_batches or self.batch_size is None or self.num_processes <= 1 or self.drop_last:
+            return False
+        try:
+            if len(self.batch_sampler) != 1:
+                return False
+        except (TypeError, AttributeError):
+            return False
+        sampler = getattr(self.batch_sampler, "sampler", None)
+        if sampler is None:
+            return False
+        try:
+            return len(sampler) == self.batch_size
+        except (TypeError, AttributeError):
+            return False
 
     def _iter_with_split(self):
         initial_data = []
@@ -202,6 +228,11 @@ class BatchSamplerShard(BatchSampler):
                 yield batch[batch_length * self.process_index : batch_length * (self.process_index + 1)]
 
     def _iter_with_no_split(self):
+        # Replicating the only full batch would give every process the same samples. Yield nothing instead so every
+        # process still produces the same number of batches (a multiple of `num_processes`).
+        if self.even_batches and self._is_single_full_batch():
+            return
+
         initial_data = []
         batch_to_yield = None
         for idx, batch in enumerate(self.batch_sampler):
